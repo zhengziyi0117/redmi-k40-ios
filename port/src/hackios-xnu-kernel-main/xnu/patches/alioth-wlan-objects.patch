@@ -1,0 +1,19 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,16 @@
+ 
+ bsd/dev/monotonic.c optional monotonic
+ bsd/dev/redwood_input.c		standard
++bsd/dev/alioth_pcie.c		standard
++bsd/dev/alioth_wlan_rpmh.c		standard
++bsd/dev/alioth_wlan_mhi.c		standard
++bsd/dev/alioth_wlan_qmi.c		standard
++bsd/dev/alioth_wlan_wlfw.c		standard
++bsd/dev/alioth_wlan_lx.c		standard
++bsd/dev/alioth_wlan_pcie.c		standard
++bsd/dev/alioth_wlan_wifi.c		standard
++bsd/dev/alioth_wlan_sta.c		standard
++bsd/dev/alioth_wlan_apple80211.c		standard
+ bsd/dev/redwood_virtio_input.c	standard
+ bsd/dev/redwood_goodix.c	standard
+ bsd/dev/redwood_buttons.c	standard
