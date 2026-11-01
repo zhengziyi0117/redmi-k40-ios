@@ -31,6 +31,33 @@
 - `python3 scripts/prepare_wifi_root.py --wifid-console-log` 给 wifid 加 `OS_ACTIVITY_DT_MODE`，
   把 WiFiManager 的 os_log 镜像到 `/dev/console`，用来看到它拒绝加入的原因。默认 RAM 根不变。
 
+### 发热与耗电
+
+- 所有已保存的会话日志（包括 `runtime/captures/stable` 稳定基线）里，SpringBoard 每秒约 4000 次
+  查找 `com.apple.sleepd.sleepserver` 失败（station03 一次 30 分钟会话约 200 万次）。查找方是
+  `Sleep.framework`，失败后立即重试、不退避，SpringBoard 和 launchd 因此各占一个核心。
+- 原因：RAM 根只有少量 launchd 任务，没有 stock 的 `com.apple.sleepd`；系统卷里有 sleepd 程序。
+  `prepare_wifi_root.py` 现在加入该任务，并去掉 `RunAtLoad`、`KeepAlive` 和 `LaunchEvents`，
+  只在有人查找时才启动。重建后的根只多出这一个 plist，`check-image.sh` 读回 129 个条目。
+  修复前的镜像备份在 `backups/wifi-root/root-before-sleepd-20261101.apfs`。
+- 真机验证（sleepd01，2026-11-01，桌面待机、USB 充电、电量 9%）：约 9 分钟内 sleepd 查找失败 0 次，
+  也没有 sleepd 崩溃记录。GPU 旁的 SoC 传感器稳定在 42–45 °C，此前同类会话为 55–62 °C
+  （station03 开机约 2 分钟时已到 52.9/56.7 °C）。启动后约 20 秒内 GeneralMapsWidget 有一阵
+  geod/navigationService 查找，随后停止，旧会话同样有。未测量交互使用时的温度和耗电。
+- 另一原因：原 `cpufreq=1` 把三个 CPU 簇固定在最高频率（1804/2419/3187 MHz），
+  内存带宽投票固定为最大值 16383，没有任何降频。现在 `redwood_cpufreq.c`（overlay 新增）在开机
+  拉满后交给调频线程：每 20 ms 按各核空闲时间选档；核心忙于 80% 或触摸/按键后 500 ms 内用最高档，
+  否则选让最忙核心约 70% 忙的最低档，下降每次最多一半。小核簇不低于 614 MHz（loader 在该簇的一个
+  核上不停轮询）。内存：触摸期间或大核平滑负载超过 40% 时投最大票，否则 1 秒后降到 1024；开机第一分钟
+  不动。RPMh 槽位 0 加了共享锁，`alioth_wlan_rpmh.c` 也使用。每分钟一行
+  `cpufreq: the last 60 s: ...` 记录平均频率和内存高档比例。`cpufreq_pin=1` 恢复旧的固定最高档；
+  可调：`cpufreq_ms`、`cpufreq_boost_ms`、`cpufreq_floor0`、`ddr_idle`、`cpufreq_log`。
+  修改前的内核备份在 `backups/kernel/mach-before-governor-61a2dc29.bin`。
+- 真机验证（gov01/gov02，2026-11-01，电量 7–9%、USB 充电）：未见 panic，Wi-Fi 正常连接。
+  桌面待机时三簇平均 615/713/844 MHz。第一版的内存判断用单个 20 ms 采样，合成器每帧几毫秒的 CPU
+  就足以触发，内存一直是 100% 高档；改为平滑负载后，轻度使用时内存高档 27–35%，持续操作时 74–88%，
+  三簇平均 1.2–1.3/1.7–1.8/2.1–2.3 GHz。操作期间传感器 45–51 °C。用户确认操作手感没有变差。
+
 ## 改动
 
 - 新增 `alioth_wlan_*` PCIe/MHI/QRTR/QMI/WLFW 模块，保留原基线的其他硬件驱动。
@@ -101,7 +128,7 @@ python3 scripts/prepare_wifi_root.py
 bash build/k40/tools/apfs/check-image.sh runtime/wifi/root.apfs redwood=runtime/wifi/root
 ```
 
-当前带网络服务的 RAM 根有 128 个条目，已通过 APFS 检查及内核 reader 逐项读回。
+当前带网络服务的 RAM 根有 129 个条目（含 sleepd），已通过 APFS 检查及内核 reader 逐项读回。
 
 ## 真机运行
 

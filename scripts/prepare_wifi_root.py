@@ -55,7 +55,18 @@ for source, name in [('amss20.bin', 'amss20.bin'), ('m3.bin', 'm3.bin'),
 subprocess.run(['python3', str(root / 'build/k40/userland/mkjobs.py'),
     str(root / 'build/k40/ios165/rootfs'), str(tree / 'LaunchDaemons'),
     'com.apple.configd', 'com.apple.mDNSResponder', 'com.apple.securityd',
-    'com.apple.mobile.keybagd'], check=True)
+    'com.apple.mobile.keybagd', 'com.apple.sleepd'], check=True)
+# SpringBoard's Sleep.framework looks up com.apple.sleepd.sleepserver again at
+# once whenever the lookup fails: ~4000 failed lookups a second for the whole
+# session, SpringBoard and launchd each keeping a core busy at its top clock
+# (the heat and the battery drain). With the stock job the name exists. It is
+# started on demand only, like mkjobs.py --rest jobs: no RunAtLoad and none of
+# its launch events (alarms, Watch, CloudKit), which this port has nothing for.
+job = tree / 'LaunchDaemons/com.apple.sleepd.plist'
+plist = plistlib.loads(job.read_bytes())
+for key in ('RunAtLoad', 'KeepAlive', 'LaunchEvents'):
+    plist.pop(key, None)
+job.write_bytes(plistlib.dumps(plist, fmt=plistlib.FMT_BINARY))
 if args.wifid_console_log:
     # WiFiManager's join decisions go to os_log only. With OS_ACTIVITY_DT_MODE,
     # libsystem_trace also writes them to stderr, which this job sends to

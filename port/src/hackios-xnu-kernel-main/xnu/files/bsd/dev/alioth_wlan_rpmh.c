@@ -26,6 +26,9 @@ extern int alioth_wlan_log(const char *, ...) __printflike(1, 2);
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 int alioth_wlan_rpmh_vreg_enable(const char *res, unsigned mv);
 int alioth_wlan_rpmh_wifi_power(void);
+/* redwood_cpufreq.c: its memory votes go through the same ACTIVE TCSs while the system runs */
+extern void redwood_rpmh_acquire(void);
+extern void redwood_rpmh_release(void);
 
 /* Live downstream DT has two positional reg entries, no reg-names. */
 #define RH_RSC_PA       0x18220000u
@@ -356,6 +359,7 @@ alioth_wlan_rpmh_vreg_enable(const char *res, unsigned mv)
 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 		return EBUSY;
 	}
+	redwood_rpmh_acquire();
 	int error = EIO;
 	uint32_t address = 0;
 	if (rh_poisoned) {
@@ -373,6 +377,7 @@ out:
 	if (error) {
 		printf("ALIOTH RPMH: enable failed errno=%d\n", error);
 	}
+	redwood_rpmh_release();
 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 	return error;
 }
@@ -398,6 +403,7 @@ alioth_wlan_rpmh_wifi_power(void)
 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
 		return EBUSY;
 	}
+	redwood_rpmh_acquire();
 	int error = EIO;
 	if (rh_poisoned) {
 		printf("ALIOTH RPMH: previous uncertain transaction; refusing further access\n");
@@ -416,6 +422,7 @@ out:
 	if (error) {
 		printf("ALIOTH RPMH: Wi-Fi rails failed errno=%d\n", error);
 	}
+	redwood_rpmh_release();
 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 	return error;
 }

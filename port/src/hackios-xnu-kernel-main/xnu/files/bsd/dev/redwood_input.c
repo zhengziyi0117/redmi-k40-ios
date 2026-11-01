@@ -70,6 +70,7 @@ static uint32_t touch_head, touch_tail;        /* read from head, add at tail */
 #define EXIT_HOLD_MS    1500
 
 extern void loader_return(void);
+extern void redwood_cpufreq_touch(void);        /* redwood_cpufreq.c: the processor at full speed while a finger is down */
 extern void alioth_wlan_wifi_init(void);
 extern void alioth_pcie_init(void);     /* alioth_pcie.c: the Wi-Fi's PCIe controller, with pcie= in the boot-args */
 
@@ -134,6 +135,9 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	}
 	lck_mtx_unlock(&touch_lock);
 	wakeup(&touch_queue);
+	if (from_driver) {
+		redwood_cpufreq_touch();
+	}
 }
 
 void
