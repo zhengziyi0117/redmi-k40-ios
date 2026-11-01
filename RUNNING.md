@@ -11,7 +11,17 @@
 
 这次采用内存启动，原 Android 系统及 userdata 保留。没有执行 flash、erase、解锁或 GPT 修改；loader 会向已有 `logdump` 分区写运行日志。iOS 数据没有配置写入 `darwin`，本次会话的设置不保证跨重启保留。
 
-当前 Wi-Fi 测试会话同样设为 1800 秒，时间到后内核回到 loader。想提前返回 Android，可在电脑执行：
+测试会话都有时限（`start_ios.sh` 1800 秒，`run_wifi_probe.py --seconds N` 为 N 秒）。时间到后内核交还 GPU、回到 loader，
+画面停在 backboardd 重启时的转圈图标上不再变化：这是会话结束，不是开机卡住（2026-11-01 一次 900 秒的测试会话即如此）。
+日常使用请不限时启动带 Wi-Fi 的内核（`--seconds 0` 实际设为一周，已在真机验证）：
+
+```bash
+bash scripts/start_ios.sh ANDROID_SERIAL
+python3 scripts/run_wifi_probe.py --steps 12 --seconds 0 --out runtime/wifi/daily
+```
+
+第二条会先等正在运行的内核完成 GPU 初始化再停掉它；在其初始化中途停掉，会让下一个内核卡死在 GPU 上。
+在 iOS 里关机或重启、五指按住屏幕 1.5 秒，也会结束会话、回到 loader。想返回 Android，可在电脑执行：
 
 ```bash
 fastboot -s xnuloader reboot
