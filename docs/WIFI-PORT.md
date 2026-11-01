@@ -16,8 +16,20 @@
    关闭固件时出现过 mode-off 超时，随后仍完成硬件 reset；应继续完善关闭流程。
 
 原始日志和屏幕截图仅保存在本机 `runtime/wifi/`，包含附近 SSID、BSSID、IP 等信息，不随源码上传。
-5 GHz 后续重点是：取得对应 SSID 的 ASSOCIATE 请求与失败结果，再判断信道、加密协商或框架拒绝；
 不能从“扫描可见”直接推断收发、认证和联网均已工作。
+
+### 5 GHz 加入失败（进行中）
+
+- station02 会话结束时的请求汇总：`set 20 (ASSOCIATE)` 2 次（均为 2.4 GHz），`set 22 (DISASSOCIATE)` 4 次。
+  5 GHz 的加入请求没有到达驱动，是 iOS 用户态（wifid/IO80211）放弃的，与射频、认证和 WPA 握手无关。
+- 目标 5 GHz 热点位于 DFS 信道（52–64）。驱动在 CN 规则下把这些信道报为 `0x112`（DFS、被动），
+  而扫描结果此前固定报 `0x92`（主动、非 DFS），两处不一致。现已改为扫描结果与信道表使用相同标志；
+  这只是可能的原因，尚未验证。
+- wifid 根据 802.11d 推出 `CN` 后反复设置 COUNTRY_CODE 被拒；现改为接受并记录，射频仍使用固件选择的规则。
+- 新增诊断：断开、加入或按名称扫描后的 20 秒内记录全部 Apple80211 请求（带 UTC 时间）；
+  扫描摘要打印每个热点的 AKM、RSN capabilities 与 HT/VHT/HE；首次应答时打印发给 iOS 的信道表。
+- `python3 scripts/prepare_wifi_root.py --wifid-console-log` 给 wifid 加 `OS_ACTIVITY_DT_MODE`，
+  把 WiFiManager 的 os_log 镜像到 `/dev/console`，用来看到它拒绝加入的原因。默认 RAM 根不变。
 
 ## 改动
 

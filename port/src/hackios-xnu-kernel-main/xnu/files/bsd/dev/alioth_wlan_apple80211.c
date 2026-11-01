@@ -43,6 +43,7 @@ extern int alioth_wlan_log(const char *, ...) __printflike(1, 2);
  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
  */
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
@@ -55,6 +56,7 @@ extern int alioth_wlan_log(const char *, ...) __printflike(1, 2);
 #include <sys/redwood_sta.h>
 #include <sys/sockio.h>
 #include <sys/systm.h>
+#include <sys/time.h>
 
 #define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
 #define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
@@ -231,6 +233,14 @@ static LCK_GRP_DECLARE(apple80211_lock_group, "hakios-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
 static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+static bool channels_said;                      /* the channel list has been written to the log */
+static bool scan_named;                         /* the last scan asked for was for networks by name */
+/*
+ * COUNTRY_CODE (51): wifid works out a country from the access points' 802.11d elements and sets it, retrying
+ * every second and then every 30 s while it is refused (K40, 2026-11-01: "CN", 27 refusals). The radio keeps the
+ * domain its firmware chose (CN on this K40); the code is taken, written to the log, and given back when asked.
+ */
+static uint8_t country[3];
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
 
@@ -260,6 +270,26 @@ channel_fill(struct apple80211_channel *channel, unsigned frequency, unsigned fl
 	    0 : CHANNEL_ACTIVE) | (flags & REDWOOD_STA_CHANNEL_RADAR ? CHANNEL_DFS : 0);
 }
 
+/*
+ * The radio's own flags for that frequency (REDWOOD_STA_CHANNEL_*), as SUPPORTED_CHANNELS tells them. A network's
+ * channel is described with them too: with 0 a network on a DFS channel (52-64 in CN) was told as on an active
+ * channel without DFS (flags 0x92), while the same channel in the list was 0x112 (K40, 2026-11-01: 5 GHz on 64
+ * listed, wifid never sent its join).
+ */
+static unsigned
+channel_flags_at(unsigned frequency)
+{
+	struct redwood_sta_channel channels[96];
+	unsigned count = redwood_sta_channels(channels, 96);
+
+	for (unsigned i = 0; i < count; i++) {
+		if (channels[i].frequency == frequency) {
+			return channels[i].flags;
+		}
+	}
+	return 0;
+}
+
 /* ---- what the caller is given back ------------------------------------------------------------------- */
 
 /* At most as many bytes as it has room for. */
@@ -287,7 +317,7 @@ give_network(const struct apple80211req *request, const struct redwood_sta_bss *
 	}
 	bzero(result, sizeof(*result));
 	result->version = 1;
-	channel_fill(&result->channel, bss->frequency, 0);
+	channel_fill(&result->channel, bss->frequency, channel_flags_at(bss->frequency));
 	result->rssi = bss->rssi;
 	result->noise_known = 1;
 	result->noise = NOISE_FLOOR;
@@ -390,6 +420,16 @@ get(struct apple80211req *request)
 		for (unsigned i = 0; i < count; i++) {
 			channel_fill(&answer->channels[i], channels[i].frequency, channels[i].flags);
 		}
+		if (!channels_said) {           /* (once: what wifid compares a network's channel with) */
+			char line[400] = "";
+
+			channels_said = true;
+			for (unsigned i = 0; i < count; i++) {
+				snprintf(line + strlen(line), sizeof(line) - strlen(line), " %u:%#x", answer->channels[i].channel,
+				    answer->channels[i].flags);
+			}
+			printf("apple80211: the channels told to iOS (number:flags):%s\n", line);
+		}
 		error = give(request, answer, sizeof(*answer));
 		kfree_data(answer, sizeof(*answer));
 		return error;
@@ -437,6 +477,14 @@ get(struct apple80211req *request)
 		kfree_data(bss, sizeof(*bss));
 		return error;
 	}
+	case 51: {                              /* the country last set (the framework asks with the 3 bytes alone) */
+		uint8_t code[3];
+
+		lck_mtx_lock(&apple80211_lock);
+		memcpy(code, country, sizeof(code));
+		lck_mtx_unlock(&apple80211_lock);
+		return code[0] == 0 ? EOPNOTSUPP : give(request, code, sizeof(code));
+	}
 	default:
 		break;
 	}
@@ -470,7 +518,7 @@ get(struct apple80211req *request)
 		if (state->phase != REDWOOD_STA_JOINED) {
 			error = ENXIO;
 		} else {
-			channel_fill(&answer.channel, state->bss.frequency, 0);
+			channel_fill(&answer.channel, state->bss.frequency, channel_flags_at(state->bss.frequency));
 			error = give(request, &answer, sizeof(answer));
 		}
 		break;
@@ -573,6 +621,7 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	snprintf(said, said_size, " (a scan: type %u, %u channels of which %u are not the radio's, %u ms on each, a name of %u bytes, "
 	    "%u more names, flags %#llx)", asked->scan_type, asked->channel_count, unknown, asked->dwell_ms, asked->ssid_length,
 	    asked->name_count, asked->flags);
+	scan_named = asked->ssid_length != 0 || asked->name_count != 0;
 	if (asked->channel_count != 0 && asked->channel_count <= 64 && what->frequency_count == 0) {
 		error = EINVAL;                 /* (nothing of what is asked for is a channel of this radio's) */
 	} else {
@@ -671,6 +720,25 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 51: {                              /* the country: {version, the code in 3 bytes} in 8 */
+		uint8_t asked[8] = { 0 };
+		int error;
+
+		if (request->req_len < 7 || (error = copyin(request->req_data, asked, request->req_len < sizeof(asked) ?
+		    request->req_len : sizeof(asked))) != 0) {
+			return request->req_len < 7 ? EINVAL : error;
+		}
+		snprintf(said, said_size, " (a country: %02x %02x %02x %02x %02x %02x %02x %02x)", asked[0], asked[1], asked[2], asked[3],
+		    asked[4], asked[5], asked[6], asked[7]);
+		if (asked[4] < 'A' || asked[4] > 'Z' || asked[5] < 'A' || asked[5] > 'Z') {
+			return EINVAL;          /* (not the layout this expects: the bytes above say what came) */
+		}
+		lck_mtx_lock(&apple80211_lock);
+		memcpy(country, asked + 4, 2);
+		country[2] = 0;
+		lck_mtx_unlock(&apple80211_lock);
+		return 0;
+	}
 	case 5:                                 /* (0132) power save: the driver has none */
 	case 365:                               /* (0132) the display on or off: nothing to do */
 	case 382:                               /* (0132) abort a scan: ours end by themselves (a scan is over) */
@@ -813,9 +881,17 @@ redwood_apple80211_ioctl(u_long command, void *data)
 	static uint16_t said[512][2];
 	static int said_error[512][2];
 	static unsigned said_important;
+	/*
+	 * Around a join -- for 20 s after a leave, a join or a scan for a network by name -- every request is said,
+	 * with the time of day (UTC) to set beside wifid's own lines. On the K40 (2026-11-01) wifid gave up a 5 GHz
+	 * join without sending it (4 leaves, 2 joins, both 2.4 GHz), and what it asked just before was not in the log.
+	 */
+	static uint64_t watch_until;
+	static unsigned watch_said;
 	struct apple80211req *request = data;
-	char who[32] = "?", what[200] = "";
+	char who[32] = "?", what[200] = "", when[24] = "";
 	bool is_set = command == SIOCSA80211;
+	bool watching;
 	int error;
 
 	if (command != SIOCSA80211 && command != SIOCGA80211) {
@@ -825,17 +901,32 @@ redwood_apple80211_ioctl(u_long command, void *data)
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
 	note(request, is_set, error);
 	unsigned kind = request->req_type < 512 ? request->req_type : 511;
+	if (is_set && (kind == 20 || kind == 22 || (kind == 10 && scan_named))) {
+		uint64_t interval;
+
+		clock_interval_to_absolutetime_interval(20, NSEC_PER_SEC, &interval);
+		watch_until = mach_absolute_time() + interval;
+	}
+	watching = mach_absolute_time() < watch_until && watch_said < 3000;
+	if (watching) {
+		struct timeval now;
+
+		microtime(&now);
+		watch_said++;
+		snprintf(when, sizeof(when), "%02ld:%02ld:%02ld.%03d UTC ", (long)(now.tv_sec / 3600 % 24), (long)(now.tv_sec / 60 % 60),
+		    (long)(now.tv_sec % 60), (int)(now.tv_usec / 1000));
+	}
 	bool important = kind == 10 || kind == 19 || kind == 20 || kind == 21 || kind == 22;
 	bool changed = said[kind][is_set] != 0 && said_error[kind][is_set] != error;
-	if (said[kind][is_set] < 12 || (important && said_important < 600) || (changed && said_important < 600)) {
-		if (said[kind][is_set] >= 12) {
+	if (said[kind][is_set] < 12 || (important && said_important < 600) || (changed && said_important < 600) || watching) {
+		if (said[kind][is_set] >= 12 && !watching) {
 			said_important++;
 		}
 		if (said[kind][is_set] < UINT16_MAX) {
 			said[kind][is_set]++;
 		}
 		said_error[kind][is_set] = error;
-		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+		printf("apple80211: %s%s %s %d (%s), value %d, %u bytes%s: %s", when, who, is_set ? "sets" : "gets", request->req_type,
 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
 		    EOPNOTSUPP ? "REFUSED\n" : "");
 		if (error != 0 && error != EOPNOTSUPP) {

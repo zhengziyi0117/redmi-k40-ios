@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Keep the known-good boot programs and add this K40's QCA6390 firmware."""
 from pathlib import Path
+import argparse
 import hashlib
 import json
 import os
@@ -9,6 +10,10 @@ import shutil
 import subprocess
 import sys
 
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--wifid-console-log', action='store_true',
+                    help="also write wifid's os_log messages to the console (diagnostic)")
+args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / 'build/k40/tools/apfs'))
 import apfs
@@ -51,6 +56,14 @@ subprocess.run(['python3', str(root / 'build/k40/userland/mkjobs.py'),
     str(root / 'build/k40/ios165/rootfs'), str(tree / 'LaunchDaemons'),
     'com.apple.configd', 'com.apple.mDNSResponder', 'com.apple.securityd',
     'com.apple.mobile.keybagd'], check=True)
+if args.wifid_console_log:
+    # WiFiManager's join decisions go to os_log only. With OS_ACTIVITY_DT_MODE,
+    # libsystem_trace also writes them to stderr, which this job sends to
+    # /dev/console and so to the loader log.
+    job = tree / 'LaunchDaemons/com.apple.wifid.plist'
+    plist = plistlib.loads(job.read_bytes())
+    plist.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
+    job.write_bytes(plistlib.dumps(plist, fmt=plistlib.FMT_BINARY))
 probe = {
     'Label': 'com.redwood.wifi-check', 'RunAtLoad': True,
     'ProgramArguments': ['/redwood/bin/net_test', 'waitaddr', 'en0', '600',

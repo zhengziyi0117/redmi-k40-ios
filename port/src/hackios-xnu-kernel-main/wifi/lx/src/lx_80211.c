@@ -629,6 +629,50 @@ linuxkpi_ieee80211_scan_completed(struct ieee80211_hw *hw, struct cfg80211_scan_
 	lx_os_unlock();
 }
 
+/*
+ * For the log: what a network's RSN element offers -- its kinds of key management (2: a passphrase, WPA2; 8: SAE,
+ * WPA3; 1: 802.1X; "v" before one of another vendor's) and its capabilities (0x80: protected management frames
+ * possible, 0x40: required) -- and which of HT, VHT and HE it announces: what decides whether iOS will try it.
+ */
+static void
+describe(const uint8_t *elements, unsigned length, char *out, size_t size)
+{
+	const uint8_t *rsn = element(elements, length, 48), *at, *end;
+	unsigned count;
+	bool he = false;
+
+	out[0] = 0;
+	if (rsn != NULL) {
+		at = rsn + 2;
+		end = at + rsn[1];
+		/* version (2), the group's cipher (4), the pairwise ciphers (2 + 4 each), key management (2 + 4 each), caps (2) */
+		count = end - at >= 8 ? (unsigned)(at[6] | at[7] << 8) : ~0u;
+		if (count > (unsigned)(end - at - 8) / 4) {
+			snprintf(out, size, " (RSN cut short)");
+		} else {
+			at += 8 + 4 * count;
+			count = end - at >= 2 ? (unsigned)(at[0] | at[1] << 8) : ~0u;
+			if (count > (unsigned)(end - at - 2) / 4) {
+				snprintf(out, size, " (RSN without key management)");
+			} else {
+				snprintf(out, size, " AKM");
+				for (at += 2; count != 0; count--, at += 4) {
+					snprintf(out + strlen(out), size - strlen(out), " %s%u", at[0] == 0x00 && at[1] == 0x0f &&
+					    at[2] == 0xac ? "" : "v", at[3]);
+				}
+				if (end - at >= 2) {
+					snprintf(out + strlen(out), size - strlen(out), " caps %#x", at[0] | at[1] << 8);
+				}
+			}
+		}
+	}
+	for (unsigned a = 0; a + 3 <= length && a + 2 + elements[a + 1] <= length; a += 2 + elements[a + 1]) {
+		he |= elements[a] == 255 && elements[a + 1] >= 1 && elements[a + 2] == 35;	/* (HE capabilities: extension 35) */
+	}
+	snprintf(out + strlen(out), size - strlen(out), "%s%s%s", element(elements, length, 45) != NULL ? " HT" : "",
+	    element(elements, length, 191) != NULL ? " VHT" : "", he ? " HE" : "");
+}
+
 /* What was heard, the strongest first. Names and addresses of other people's networks: for the log of the run only. */
 static void
 say_heard(struct lx_radio *radio)
@@ -640,7 +684,7 @@ say_heard(struct lx_radio *radio)
 
 	for (unsigned n = 0; n < radio->heard_count; n++) {
 		const struct lx_heard *network = NULL;
-		char name[33];
+		char name[33], offers[80];
 		unsigned which = 0, channel;
 		bool wanted;
 
@@ -667,10 +711,11 @@ say_heard(struct lx_radio *radio)
 		/* (the network that is wanted is the user's own: its name is not said even here) */
 		wanted = radio->want_length != 0 && network->name_length == radio->want_length &&
 		    memcmp(network->name, radio->want, radio->want_length) == 0;
-		printf("lx: heard: channel %3u (%u MHz) %4d dBm  %02x:%02x:%02x:%02x:%02x:%02x  %s, %u times  \"%s\"\n", channel,
+		describe(network->elements, network->elements_length, offers, sizeof(offers));
+		printf("lx: heard: channel %3u (%u MHz) %4d dBm  %02x:%02x:%02x:%02x:%02x:%02x  %s%s, %u times  \"%s\"\n", channel,
 		    network->frequency, network->signal, network->sender[0], network->sender[1], network->sender[2], network->sender[3],
 		    network->sender[4], network->sender[5], !(network->capability & 0x10) ? "open" : network->protected ? "RSN" :
-		    "protected", network->times, wanted ? "(the network that is wanted)" : name);
+		    "protected", offers, network->times, wanted ? "(the network that is wanted)" : name);
 	}
 	for (unsigned channel = 0; channel < nitems(on_channel); channel++) {
 		if (on_channel[channel] != 0) {
