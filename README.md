@@ -26,7 +26,7 @@ loader 会把诊断日志写入手机已有的 `logdump` 分区。原 Android �
 - `scripts/prepare_wifi_root.py`：保留已验证的桌面启动程序，加入本机提取的无线固件和网络服务。
 - `scripts/run_wifi_probe.py`：在已经驻留完整系统的 XNU loader 中启动 Wi-Fi 测试。
 - `scripts/start_ios.sh`、`scripts/capture_ios.py`：原桌面 RAM 启动与日志采集。
-- [适配记录与复现说明](docs/WIFI-PORT.md)、[本机会话说明](RUNNING.md)。
+- [适配记录与复现说明](docs/WIFI-PORT.md)、[本机会话说明](RUNNING.md)、[不接电脑启动 iOS 的计划与进展](docs/ON-PHONE-BOOT.md)。
 
 设备备份、无线固件、Apple iOS 文件、工具链、生成的镜像、原始日志和截图由 `.gitignore` 排除。
 这些输入须在自己的机器上准备；本仓库不是可直接刷入的 ROM 包。
