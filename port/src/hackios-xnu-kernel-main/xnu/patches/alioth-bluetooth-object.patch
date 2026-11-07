@@ -1,0 +1,10 @@
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -83,6 +83,7 @@
+ iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
+ iokit/Kernel/RedwoodGPU.cpp				optional iokitcpp
++iokit/Kernel/AliothBluetooth.cpp optional iokitcpp
+ iokit/Kernel/RedwoodWLAN.cpp			optional iokitcpp
+ iokit/Kernel/RedwoodBattery.cpp			optional iokitcpp
+ iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp

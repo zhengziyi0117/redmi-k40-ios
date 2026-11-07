@@ -31,6 +31,23 @@
 - `python3 scripts/prepare_wifi_root.py --wifid-console-log` 给 wifid 加 `OS_ACTIVITY_DT_MODE`，
   把 WiFiManager 的 os_log 镜像到 `/dev/console`，用来看到它拒绝加入的原因。默认 RAM 根不变。
 
+### 应用联网恢复（2026-11-06）
+
+用户反馈：Wi-Fi 已连接，但 Safari 和其他应用不能发出请求。
+RAM 根缺少 `com.apple.nehelper-embedded`（提供 `com.apple.nehelper` 和 `com.apple.networkd_privileged`）、
+`com.apple.trustd`、`com.apple.nsurlsessiond` 三个 stock 任务。已加入这些任务，保留原来的 configd/DHCP 通路。
+这是同时补齐依赖后的结果，尚未逐一移除服务定位哪个是唯一必要条件。
+
+本机 `network-control/connected` 会话：
+
+- DHCP 获得地址，configd 发布默认路由与 DNS，reachability 为 reachable；
+- 直接连接 `1.1.1.1:80` 收到 HTTP 301；
+- 域名 TCP 请求收到 HTTP 200；CFNetwork 请求 `http://example.com` 和 `https://example.com` 均返回 200，
+  各 577 字节，约 0.33 / 0.59 秒；用户确认 Safari 可以打开页面。
+
+分层探测现在拆成独立 launchd 任务，等待 en0 获得地址后执行，避免某个 DNS/TCP 调用阻塞后续全部测试。
+日志仅保存在本机 `runtime/validation/20261106/`。未据此推断所有应用的账号/云服务均已适配。
+
 ### 发热与耗电
 
 - 所有已保存的会话日志（包括 `runtime/captures/stable` 稳定基线）里，SpringBoard 每秒约 4000 次
@@ -73,6 +90,8 @@
 - 采用上游的开关状态保留修正：驱动尚未就绪时也记住 iOS 的电源请求。
 
 ## 准备工具链和源码
+
+首次安装的完整顺序（含系统输入、USB 试启动与手机存储安装）见 [安装与构建指南](INSTALL.md)。以下保留 Wi-Fi 专项构建细节。
 
 ```bash
 python3 scripts/prepare_workspace.py
@@ -124,6 +143,7 @@ ath11k 对象使用固定 Linux 7.0.14 和 FreeBSD 15.1 归档，上游构建脚
 此处的镜像配对是本次实际使用的配对，不承诺不同版本或其他人的预编译包可以混用。
 
 ```bash
+bash scripts/build_prefs_store.sh
 python3 scripts/prepare_wifi_root.py
 bash build/k40/tools/apfs/check-image.sh runtime/wifi/root.apfs redwood=runtime/wifi/root
 ```
@@ -152,3 +172,65 @@ python3 scripts/capture_ios.py --out runtime/wifi/manual/capture
 测试会话持续 1800 秒，随后返回 loader；返回 Android 用 `fastboot -s xnuloader reboot`。
 
 密码直接在手机 Settings 输入。凭据文件与本机原始日志不应加入版本控制。
+
+## 显示、触摸与账号服务（2026-11-06）
+
+`alioth_display.c` 将软件缩放结果写入后台缓冲区，再通过 SM8250 DPU 的 VIG0/CTL0 换帧。
+显存只使用本机 DT 的 `cont_splash_region`，三块各 10371072 字节；不复用正扫描或等待锁存的缓冲。
+部分帧先保留上一完整帧的内容。返回 loader 前恢复 boot framebuffer。
+时钟使用 SM8250 的 GCC + 0xb00c、DISPCC + 0x3000 / 0x2080 / 0x4004，不能使用旧 redwood display_probe 的另一套偏移。
+
+`aliothflip=1 fb_beat=0 fb_queue=1 touch_poll_us=2000` 减少软件刷新等待与触摸采样延迟；用户确认更流畅。
+`fb_hz=120` 目前仅是界面请求：本机 INTF1 的硬件计数为每 100 ms 6 次，约 60 Hz。
+原机实际选用 k11a_38_08_0a 的 command-mode 面板，有独立 DCS 时序切换命令，真正 120 Hz 尚未适配，
+不能套用 Apollo/Redwood 的 video-mode 时序来推断本机结果。
+
+账号根加入 stock accountsd、akd、appleaccountd、amsaccountsd 和 itunesstored 后，用户确认登录按钮可点击，
+但认证仍转圈。后续诊断根补 APS/IDS、SCHelper、AppSSO、adid，`--account-console-log` 记录认证日志；
+缺失的 identityservicesd.app 从本地 `ios165/rootfs.dmg` 单独提取放进 RAM 根，程序/资源不纳入源码。
+使用该根需要保留原始 `rootfs.dmg`（fetch.sh 使用 KEEP=1），或本机已有 runtime/account-input 缓存。
+尚未确认 Apple ID 登录成功。认证日志可能含账号信息，留在本机被忽略的目录中。
+
+认证日志进一步定位到：`ADIProvisioningStart` / `End` 的 HTTP 响应为 200，但 `ADIProvisioningEnd` 返回 -42410，
+AuthKit 包装为 `AKAnisetteError -8004`。DeviceCheck 最初因 mobileactivationd 缺失查询自动时间失败；
+补入原生 mobileactivationd / timed 后，激活服务初始化的 UIK bump/commit 返回 `0xe00002c7`（IOKit unsupported）。
+这只证明当前移植的设备认证链尚未跑通，不把错误码臆断为密码错误或宣称 Apple ID 已可用。
+
+显示同步再修正：这版系统实际交替使用 IOSurface 3/4。保持单帧队列，直到 CPU 复制和录制读取完成才释放队列位置，
+防止渲染器提前复用 CPU 正在读的 surface。启动参数 TUNABLE 在启动后只读，运行态队列标志使用独立可写变量。
+硬件换帧前后台缓冲隔离与渲染 surface 的生命周期是两个都需要满足的条件。
+
+## GPU、声音、蓝牙组件构建（2026-11-06）
+
+详细供体版本、板级差异和验收范围见 [上游评估](UPSTREAM-REVIEW-20261106.md)。
+已有工具链、Mesa 库、已提取系统卷和本机固件后，用户态组件分别构建：
+
+```bash
+bash scripts/build_display_bridge.sh
+bash scripts/build_audio_plugin.sh
+bash scripts/build_bluetooth_bridge.sh
+bash scripts/build_prefs_store.sh
+bash scripts/build_wifi_kernel.sh
+python3 scripts/prepare_wifi_root.py --display-bridge build/k40/userland/obj/libredwood-gl.dylib --audio --bluetooth
+bash build/k40/tools/apfs/check-image.sh runtime/wifi/root.apfs redwood=runtime/wifi/root
+```
+
+GPU bridge 构建需要现有 `runtime/wifi/root/lib/libOSMesa.8.dylib`，也可用 `DISPLAY_MESA` 指定独立输入。
+存储构建会检查根镜像中的桥接库、音频 HAL、存档工具与本地构建产物一致，并确认相应固件及原生服务齐全。
+音频固件来自本机备份 `firmware/audio/`，蓝牙来自 `firmware/bluetooth/{htbtfw20.tlv,htnv20.bin}`。
+这些原始输入与校准数据都不随仓库分发。`--audio-test` 仅增加诊断用的三秒 AudioQueue 轻音任务，正式镜像不带此参数。
+
+使用驻留 USB 诊断 loader（不是存储启动的 loader）迭代：
+
+```bash
+python3 scripts/run_wifi_probe.py --steps 12 --seconds 0 --display-flip 1 --gpu-scale --prefs-store --sound-level 5 --bt-step 6 --out runtime/validation/audio-bt
+```
+
+`--bt-console-log` 可额外镜像蓝牙日志。`--audio-step` 与 `--bt-step` 的早期阶段用于分层诊断；
+通过 ROM、固件和服务初始化不等于已完成听感、扫描、配对或通话验证。当前功放保护 DSP 未启用，
+不使用供体校准；播放保持低增益、36 dB 衰减和软件限幅。麦克风与震动没有在本机验证。
+
+`audio-bt04` 的应用播放已通过：加入原生 `com.apple.nanoregistryd`，解除 mediaserverd 对
+`com.apple.nano.nanoregistry.paireddeviceregistry` 的等待；`mediaremoted` 提供系统输出上下文。
+AudioQueueStart 返回 0，三秒的 144000 帧全部提交，Speaker 路由正常，HAL 0 帧丢弃；
+双功放在非静音输入后 35 ms 启动，随后因三秒静音正常关闭。听感与蓝牙配对尚待用户实测。

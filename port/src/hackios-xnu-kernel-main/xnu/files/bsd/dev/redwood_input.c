@@ -354,5 +354,11 @@ redwood_input_init(void)
 	redwood_wifi_init();
 	alioth_pcie_init();
 	alioth_wlan_wifi_init();
+#if defined(PLATFORM_ALIOTH)
+    extern void alioth_audio_port_init(void);
+    alioth_audio_port_init();
+    extern void alioth_bt_init(void);
+    alioth_bt_init();
+#endif
 	redwood_adsp_init();
 }

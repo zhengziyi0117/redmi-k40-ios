@@ -1,0 +1,326 @@
+#if defined(PLATFORM_ALIOTH)
+/* Alioth port of enesuzun2002/hakios-apollo 620b134a (APSL 2.0); board inputs checked against K40 DTB. */
+/*
+ * /dev/alioth-audio: what iOS plays, for the Xiaomi Mi 10T (apollo). A copy of bsd/dev/hakios.audio.c without its
+ * recording and without the redwood drivers it starts; the plug-in's protocol is the same (sys/alioth_audio.h).
+ * hakios.alioth_sound.c takes the frames (alioth_audio=5).
+ */
+/*
+ * /dev/alioth-audio: the sound that iOS plays (see sys/redwood_audio.h).
+ *
+ * What is written goes to a sink, a driver that plays it: on apollo the speakers, through the
+ * audio DSP (hakios.alioth_sound.c, alioth_audio=5), when it is up; else nowhere.
+ *
+ * (redwood's copy also keeps a recording, boot-arg rec_sound=N, for the loader to hand to the host.
+ * Here that is NOT there yet: nothing takes the recording's memory -- rec_base stays NULL --, so
+ * rec_sound, rec_sound_fed and rec_sound_mic do nothing, and audio_record() below returns at once.
+ * Its code is kept as redwood's is, for when it is brought over.)
+ *
+ * When the writer has stopped, a line in the log says how long it wrote, at what rate, how much
+ * of it was not silence and how loud: the only way to "hear" a machine one cannot listen to.
+ * (The audio server writes for as long as its device runs, a second or two beyond the sound.)
+ */
+#include <kern/clock.h>
+#include <kern/locks.h>
+#include <kern/thread_call.h>
+#include <libkern/libkern.h>
+#include <mach/mach_types.h>
+#include <mach/vm_param.h>
+#include <miscfs/devfs/devfs.h>
+#include <pexpert/pexpert.h>
+#include <sys/conf.h>
+#include <sys/errno.h>
+#include <sys/proc.h>
+#include <sys/alioth_audio.h>
+#include <sys/alioth_audio_port.h>
+
+/* into the loader's log as well (as the other apollo drivers): whether iOS writes is to be seen during a run */
+extern void loader_log_putc(char c);
+
+static int say(const char *format, ...) __printflike(1, 2);
+
+static int
+say(const char *format, ...)
+{
+	char line[300];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	return printf("%s", line);
+}
+#include <sys/systm.h>
+#include <sys/uio.h>
+#include <vm/vm_kern.h>
+
+extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
+
+#define CHUNK_FRAMES    1024            /* what one pass of write() moves */
+#define QUIET_MS        500             /* no write for this long: the writer has stopped */
+#define SILENCE         8               /* samples no larger than this are silence */
+#define REC_MAX_SECONDS 1200            /* 220 MB */
+#define MAX_BELOW       (102 * 8)       /* the most iOS's volume may be under the loudest: 102 dB, in eighths */
+
+struct rec_header {
+	char     magic[8];              /* "RWSND001" */
+	uint32_t rate, channels;        /* ALIOTH_AUDIO_RATE, REDWOOD_AUDIO_CHANNELS; the samples are 16-bit */
+	uint32_t blocks;
+	uint32_t reserved;
+};
+struct rec_block {
+	uint64_t nanoseconds;           /* when it was written, since the kernel started */
+	uint32_t frames;
+	uint32_t reserved;
+};
+
+/* { physical address, bytes, kernel address } of the recording, for the loader: osfmk/arm64/loader_return.c */
+extern uint64_t loader_sound[3];
+
+static LCK_GRP_DECLARE(audio_lck_grp, "alioth-audio");
+static LCK_MTX_DECLARE(audio_lock, &audio_lck_grp);
+static LCK_MTX_DECLARE(audio_write_lock, &audio_lck_grp);      /* one write() at a time: write_frames is its */
+
+static alioth_audio_sink_t audio_sink;
+
+static uint8_t *rec_base;
+static bool rec_fed;                    /* boot-arg rec_sound_fed=1: what the guard let through is recorded, not what was written */
+static bool rec_mic;                    /* boot-arg rec_sound_mic=1: what the microphone hears (hakios.mic.c) */
+static uint64_t rec_size, rec_used;
+static uint64_t rec_frames, rec_frames_max;
+
+/* the stretch of writing in progress */
+static uint64_t stretch_first, stretch_last;    /* mach_absolute_time() of its first and its latest write */
+static uint64_t stretch_frames, stretch_latest; /* frames written, and how many of them by the latest write */
+static uint64_t stretch_sound, stretch_lost;    /* frames in writes that were not silence; frames the sink did not take */
+static uint32_t stretch_peak;                   /* the largest sample, as an absolute value */
+static thread_call_t report_call;
+static bool report_armed;
+
+static void
+audio_report(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t frames, latest, sound, lost, deadline, since = 0, lasted = 0;
+	uint32_t loudest;
+
+	lck_mtx_lock(&audio_lock);
+	absolutetime_to_nanoseconds(mach_absolute_time() - stretch_last, &since);
+	if (since < QUIET_MS * NSEC_PER_MSEC) {
+		/* still writing: look again later */
+		clock_interval_to_deadline(2 * QUIET_MS, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(report_call, deadline);
+		lck_mtx_unlock(&audio_lock);
+		return;
+	}
+	absolutetime_to_nanoseconds(stretch_last - stretch_first, &lasted);
+	frames = stretch_frames;
+	latest = stretch_latest;
+	sound = stretch_sound;
+	lost = stretch_lost;
+	loudest = stretch_peak;
+	stretch_frames = stretch_sound = stretch_lost = 0;
+	stretch_peak = 0;
+	report_armed = false;
+	lck_mtx_unlock(&audio_lock);
+
+	say("alioth-audio: %llu.%02llu s written", frames / ALIOTH_AUDIO_RATE,
+	    frames % ALIOTH_AUDIO_RATE * 100 / ALIOTH_AUDIO_RATE);
+	if (lasted >= NSEC_PER_SEC) {
+		/* what was written before the latest write took the time between the first and the latest */
+		printf(" at %llu frames a second", (frames - latest) * NSEC_PER_SEC / lasted);
+	}
+	printf(", %llu.%02llu s of it sound, peak %u%% of full scale", sound / ALIOTH_AUDIO_RATE,
+	    sound % ALIOTH_AUDIO_RATE * 100 / ALIOTH_AUDIO_RATE, loudest * 100 / 32768);
+	if (lost) {
+		printf(", %llu ms lost (the sink was full)", lost * 1000 / ALIOTH_AUDIO_RATE);
+	}
+	printf("\n");
+}
+
+/* With audio_lock held. */
+static void
+audio_record(const int16_t *frames, uint32_t count)
+{
+	struct rec_header *header = (struct rec_header *)rec_base;
+	struct rec_block *block;
+	uint64_t bytes = (uint64_t)count * REDWOOD_AUDIO_FRAME;
+
+	if (rec_base == NULL || rec_frames >= rec_frames_max || rec_used + sizeof(*block) + bytes > rec_size) {
+		return;
+	}
+	block = (struct rec_block *)(rec_base + rec_used);
+	absolutetime_to_nanoseconds(mach_absolute_time(), &block->nanoseconds);
+	block->frames = count;
+	block->reserved = 0;
+	memcpy(block + 1, frames, bytes);
+	rec_used += sizeof(*block) + bytes;
+	rec_frames += count;
+	header->blocks++;
+	loader_sound[1] = rec_used;
+	if (rec_frames >= rec_frames_max) {
+		say("alioth-audio: recording finished: %llu s in %u writes\n", rec_frames / ALIOTH_AUDIO_RATE, header->blocks);
+	}
+}
+
+bool
+alioth_audio_recording_fed(void)
+{
+	return false;                  /* (no recording on apollo yet) */
+}
+
+
+/* From the speakers' feeder: what the guard let through, into the recording (rec_sound_fed=1). */
+void
+alioth_audio_record_fed(__unused const int16_t *frames, __unused uint32_t count)
+{
+}
+
+static void
+audio_play(const int16_t *frames, uint32_t count)
+{
+	uint32_t loudest = 0, taken = 0;
+	uint64_t deadline;
+
+	for (uint32_t i = 0; i < count * REDWOOD_AUDIO_CHANNELS; i++) {
+		uint32_t level = frames[i] < 0 ? -(int32_t)frames[i] : frames[i];
+
+		if (level > loudest) {
+			loudest = level;
+		}
+	}
+	lck_mtx_lock(&audio_lock);
+	if (!rec_fed && !rec_mic) {
+		audio_record(frames, count);
+	}
+	if (audio_sink != NULL) {
+		taken = audio_sink(frames, count);
+		stretch_lost += count - taken;
+	}
+	stretch_last = mach_absolute_time();
+	if (stretch_frames == 0) {
+		stretch_first = stretch_last;
+	}
+	stretch_frames += count;
+	stretch_latest = count;
+	if (loudest > SILENCE) {
+		stretch_sound += count;
+	}
+	if (loudest > stretch_peak) {
+		stretch_peak = loudest;
+	}
+	if (!report_armed && report_call != NULL) {
+		report_armed = true;
+		clock_interval_to_deadline(2 * QUIET_MS, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(report_call, deadline);
+	}
+	lck_mtx_unlock(&audio_lock);
+}
+
+void
+alioth_audio_set_sink(const char *name, alioth_audio_sink_t sink)
+{
+	lck_mtx_lock(&audio_lock);
+	audio_sink = sink;
+	lck_mtx_unlock(&audio_lock);
+	say("alioth-audio: sound goes to %s\n", name);
+}
+
+static int
+audio_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+{
+	return 0;
+}
+
+static int
+audio_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+{
+	return 0;
+}
+
+/* (4 KB: not on the kernel's stack; audio_write_lock is held while it is used, as uiomove() may sleep and audio_lock is not) */
+static int16_t write_frames[CHUNK_FRAMES * REDWOOD_AUDIO_CHANNELS];
+
+static int
+audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	int16_t *frames = write_frames;
+	int error = 0;
+
+	lck_mtx_lock(&audio_write_lock);
+	while (uio_resid(uio) >= REDWOOD_AUDIO_FRAME) {
+		user_ssize_t bytes = uio_resid(uio);
+
+		if (bytes > (user_ssize_t)sizeof(write_frames)) {
+			bytes = sizeof(write_frames);
+		}
+		bytes -= bytes % REDWOOD_AUDIO_FRAME;
+		error = uiomove((caddr_t)frames, (int)bytes, uio);
+		if (error) {
+			break;
+		}
+		audio_play(frames, (uint32_t)(bytes / REDWOOD_AUDIO_FRAME));
+	}
+	lck_mtx_unlock(&audio_write_lock);
+	return error;
+}
+
+/* the speakers' volume, as iOS sets it (sys/redwood_audio.h): kept for the sink's driver to look at */
+static uint32_t volume_below, volume_generation;
+static bool volume_muted;
+
+static int
+audio_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags, __unused struct proc *p)
+{
+	const struct alioth_audio_volume *volume = (const struct alioth_audio_volume *)data;
+	uint32_t below;
+
+	if (command != ALIOTH_AUDIO_SET_VOLUME) {
+		return ENOTTY;
+	}
+	/* (whoever opens the device may say anything: no more than MAX_BELOW, for the sink's sums not to wrap) */
+	below = volume->below > MAX_BELOW ? MAX_BELOW : volume->below;
+	lck_mtx_lock(&audio_lock);
+	volume_below = below;
+	volume_muted = volume->muted != 0;
+	volume_generation++;
+	lck_mtx_unlock(&audio_lock);
+	say("alioth-audio: the volume: %s%u.%03u dB under the loudest\n", volume->muted ? "muted; " : "", below / 8,
+	    below % 8 * 125);
+	return 0;
+}
+
+bool
+alioth_audio_volume(uint32_t *below, bool *muted, uint32_t *generation)
+{
+	lck_mtx_lock(&audio_lock);
+	*below = volume_below;
+	*muted = volume_muted;
+	*generation = volume_generation;
+	lck_mtx_unlock(&audio_lock);
+	return *generation != 0;
+}
+
+static const struct cdevsw audio_cdevsw = {
+	.d_open = audio_open, .d_close = audio_close, .d_read = eno_rdwrt, .d_write = audio_write,
+	.d_ioctl = audio_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+
+void
+alioth_audio_init(void)
+{
+	int major = cdevsw_add(-1, &audio_cdevsw);
+
+	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "alioth-audio") == NULL) {
+		say("alioth-audio: cannot create the device\n");
+		return;
+	}
+	report_call = thread_call_allocate(audio_report, NULL);
+	say("alioth-audio: /dev/alioth-audio is there for iOS's audio plug-in\n");
+}
+
+#endif /* PLATFORM_ALIOTH */

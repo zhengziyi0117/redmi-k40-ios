@@ -1,0 +1,16 @@
+--- a/bsd/kern/kern_shutdown.c
++++ b/bsd/kern/kern_shutdown.c
+@@ -189,6 +189,13 @@
+ 		}
+ 		return EBUSY;
+ 	}
++
++#if defined(PLATFORM_ALIOTH)
++    if (!(howto & (RB_PANIC | RB_QUICK))) {
++        extern void redwood_var_save_on_return(void);
++        redwood_var_save_on_return();
++    }
++#endif
+ 
+ 	lck_mtx_lock(&vm_swap_data_lock);
+ 

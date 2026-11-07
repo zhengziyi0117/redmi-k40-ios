@@ -26,6 +26,7 @@ extern int alioth_wlan_log(const char *, ...) __printflike(1, 2);
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 int alioth_wlan_rpmh_vreg_enable(const char *res, unsigned mv);
 int alioth_wlan_rpmh_wifi_power(void);
+int alioth_wlan_rpmh_bt_power(void);
 /* redwood_cpufreq.c: its memory votes go through the same ACTIVE TCSs while the system runs */
 extern void redwood_rpmh_acquire(void);
 extern void redwood_rpmh_release(void);
@@ -421,6 +422,40 @@ alioth_wlan_rpmh_wifi_power(void)
 out:
 	if (error) {
 		printf("ALIOTH RPMH: Wi-Fi rails failed errno=%d\n", error);
+	}
+	redwood_rpmh_release();
+	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+	return error;
+}
+int
+alioth_wlan_rpmh_bt_power(void)
+{
+	/* K40 btpower DT: shared QCA6390 rails and PM8150 L16 ASD. */
+	static const struct { const char *resource; unsigned mv; } rails[] = {
+		{ "smpa6", 950 }, { "smpa5", 1900 }, { "smpc8", 1350 }, { "ldoa16", 3025 },
+	};
+	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
+	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+		return EBUSY;
+	}
+	redwood_rpmh_acquire();
+	int error = EIO;
+	if (rh_poisoned) {
+		printf("ALIOTH RPMH: previous uncertain transaction; refusing further access\n");
+		goto out;
+	}
+	error = rh_map();
+	/* Every resource is found before the first vote is sent. */
+	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); ++i) {
+		error = rh_lookup(rails[i].resource, &addresses[i]);
+	}
+	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); ++i) {
+		printf("ALIOTH RPMH: Bluetooth %s at least %u mV\n", rails[i].resource, rails[i].mv);
+		error = rh_send(addresses[i], rails[i].mv, false);
+	}
+out:
+	if (error) {
+		printf("ALIOTH RPMH: Bluetooth rails failed errno=%d\n", error);
 	}
 	redwood_rpmh_release();
 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);

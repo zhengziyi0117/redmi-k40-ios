@@ -1,9 +1,36 @@
 # 不接电脑、在手机上选择进入 iOS
 
+首次安装从 [安装与构建指南](INSTALL.md) 开始。本文包含开发机布局与历史记录，分区尺寸、备份路径和哈希约束不能直接套用到另一台手机。默认存储安装仅保存设置；v1.5 应用数据还需要单独核验并初始化 cust 尾部，见指南第 8 步。
+
 目标：开机默认进 Android；需要时从 Android 切到 iOS 启动一次，iOS 从手机自己的存储加载，不再需要电脑传 2.4 GB；
 在 iOS 里重启或关机后回到 Android。
 
-## 当前状态（2026-11-02）
+## 当前状态（2026-11-07，v1.5 已安装）
+
+v1.5 / code 6 已通过手机模块启动、桌面、Wi-Fi 自动关联、HTTP/HTTPS 200、退出回到 Android A 和模块复检。
+本次从手机读取并校验系统及 payload 用时 5.445 秒。`ios`、`exaid` 和 `boot_b` 写入后均读回匹配；实际只更新了 `boot_b`。
+恢复的数据存档为 generation 226，79,651,496 字节；其中保存了 TrollStore、Ibili 及一张真实 Photos 测试资产。
+证据：`runtime/validation/20261107/apps-stored/boot02/`、`returned-android.txt` 与 `logs/apps-store-write-20261107.log`。
+
+这版保留 v1.4 显示、音频和蓝牙组件，增加应用安装与数据归档。`cust` 的原文件系统前 8 MiB 保持原样，
+16–512 MiB 为只读应用镜像，512–1024 MiB 为两份 256 MiB 存档，用户文件配额 **240 MiB**。
+旧 `boot_b[160:192 MiB]` 设置区保留，首次迁移后不再是 v1.5 的保存目标。
+模块还会核验 cust 的前 512 MiB，允许后半部分数据正常保存。
+B 站可重建的 modmgr 缓存放在 RAM，不挤占文档和照片；后续启动会重新下载。
+
+手机端安装器为 TrollStore 2.1.1。B 站列表可以联网，导航缺字和视频显示仍未解决；实验视频显示默认关闭。
+详细安装来源、限制和备份见 [应用和数据适配](APPS-AND-DATA-20261107.md)。
+生成当前版本使用：
+
+```bash
+python3 scripts/prepare_wifi_root.py --display-bridge build/k40/userland/obj/libredwood-gl.dylib --audio --bluetooth --app-data --bili-adapter
+python3 scripts/install_ios_store.py build --app-data --bili-software-decode
+```
+
+其中 `--bili-software-decode` 仅请求软件解码偏好，尚不能保证客户端实际采用正确的解码/显示通路。
+常驻版不含自动打开应用、自动点击、测试图导入和测试音。
+
+以下为此前已验证的启动机制及 v1.4 历史记录。
 
 已在真机验证：
 
@@ -13,13 +40,69 @@
   iOS 进入桌面，可打开设置，时间正确。全程不接电脑传数据。
 - loader 启动时会把 `boot_b` 的剩余尝试次数清零（日志：`slot: boot_b has no tries left`）。
 
-尚未验证或尚未实现：
+补充验证与未验证项：
 
-- 从 iOS 重启后由 ABL 自动回退到 A 槽、进入 Android：按 ABL 的 A/B 逻辑应当如此，但还没在真机上走过一遍。
-  万一没有回退，可以用 `fastboot set_active a` 恢复。
-- 一键切换：Android 里的按钮（KernelSU 模块）还没做。目前需要在 root shell 中执行：
-  `bootctl set-active-boot-slot 1 && reboot`。
+- 2026-11-06 已实测从 B 槽 iOS 正常结束内核后，ABL 自动回退 A 槽，Android 启动完成；
+  `ro.boot.slot_suffix=_a`、`bootctl get-current-slot=0`、A 槽启动成功，B 槽不可启动。
+  `fastboot oem stop` 和 iOS「设置 → 通用 → 关机」两条路径均已实测；后者由 SpringBoard 发起关机，用户确认回到 Android。
+  iOS 菜单中的重启操作尚未单独实测。
+- 一键切换已提供 KernelSU / ReSukiSU 模块，见下一节。
 - 不接 USB 线时的启动：B 槽里的 loader 会启动 USB 设备模式以便电脑抓取日志，未接线时的表现还没测。
+
+## 手机端一键进入 iOS
+
+模块采用 KernelSU 的 [action.sh](https://kernelsu.org/guide/module.html) 入口，不需要后台服务或系统挂载。
+本机使用 ReSukiSU 4.2.0-rc1。源码在 `scripts/phone_boot_module/`。
+
+```bash
+python3 scripts/build_phone_boot_module.py
+adb push runtime/store/k40-ios-boot.zip /data/local/tmp/
+adb shell /data/adb/ksud module install /data/local/tmp/k40-ios-boot.zip
+```
+
+安装完成后重启一次 Android，使本机管理器应用暂存的模块。
+打开 ReSukiSU → 模块 → **K40 · 进入 iOS** → **操作**。
+脚本先确认 alioth、root、当前为 Android A 槽且 A 槽已成功启动、无快照合并，再检查：
+
+- 手机上的 `ios`、`exaid` 及 `boot_b` 前 160 MiB 与本地已构建镜像的 SHA-256 一致；
+- Android 的 `boot_a` 与本机备份一致；
+- 两槽的 26 组配套固件哈希一致。
+
+检查通过才调用 `bootctl set-active-boot-slot 1` 和 `reboot`。镜像变化（包括 OTA）后会拒绝启动，需重新核对安装并生成模块。
+更新存储镜像后也应重新生成和安装模块。移除模块不删除 iOS 镜像。
+只读检查入口：`sh /data/adb/modules/k40_ios_boot/action.sh --check`。
+
+2026-11-06 已实测模块入口完整启动：约 5.4 秒读取并校验存储中的系统与 payload；
+正常结束后回到 Android A 槽。设置存档的两份头部和内容 CRC 均在电脑上读回验证，
+再次启动恢复 generation 5 的 73 个文件，Wi-Fi 自动关联、DHCP 成功，随后 HTTP 和 HTTPS 均返回 200。
+上一版 v1.3 模块启动再次恢复 generation 25 的 85 个文件，自动连接后 HTTP 约 0.94 秒、HTTPS 约 3.01 秒返回 200；
+Wi-Fi 配置变化触发了 generation 26 提前存档。该次桌面截图和日志在 `runtime/validation/20261106/final-save/boot03/`。
+
+v1.4 对应本轮 GPU 缩放、低音量音频及蓝牙组件。系统卷第三段由 48 MiB 后移到 60 MiB，
+为 payload 留出 52 MiB；设置区仍为 160–192 MiB。诊断版的自动测试音任务不进入常驻镜像。
+本轮三个存储分区均读回匹配；模块启动后恢复 generation 185，Wi-Fi 自动连接，HTTP 约 0.93 秒、HTTPS 约 3.14 秒返回 200，
+GPU 缩放、音频 DSP/播放通路及蓝牙 H4 重新就绪。
+同版从存储会话正常退出后，Android A 启动完成、启动 HAL 确认槽位 0，设置双槽 CRC 有效；再通过 v1.4 模块进入 iOS。
+证据在 `runtime/validation/20261106/feature-stored/boot01/`。
+
+### 设置存档
+
+2026-11-06 增加设置保存：`boot_b` 的 160–192 MiB 预留给两份 16 MiB 的 CRC 存档。
+系统卷尾段结束于约 156.75 MiB，不与设置区重叠；loader 校验 `XNUSTORE` 清单及 CRC 后才提供写权限。
+内核与 loader 分别检查目标为 `boot_b`、大小 192 MiB、4096 字节块，只允许写块 40960–49151。
+Android A 槽、iOS 系统卷、payload 和 loader 都在写入白名单之外。
+
+`var_store` 沿用上游双槽归档，只保留 Keychains、keybags、preferences、wireless、手机/系统偏好、Accounts 和 MobileBluetooth 目录，
+不把整个 `/var` 塞进这个小存档。启动时校验并恢复较新的一份，损坏则回退另一份或使用空设置。
+保存进程仍在时，正常结束会话会请求保存；另每 60 秒保存一次。
+Wi-Fi 配置文件变化稳定 3 秒后会提前保存，不必等到下一分钟。
+实测 iOS 菜单关机会先结束保存进程：内核检测到进程已退出时保留最近一次存档，避免空等 20 秒。
+在提前保存完成前关机可能丢失刚修改的 Wi-Fi 配置；其他设置在强制断电或进程已退出时可能丢失最后一分钟的变更。
+本机原始存档包含凭据，只放在被 git 忽略的 runtime/backups 下。
+
+构建先运行 `bash scripts/build_prefs_store.sh`，再重建 Wi-Fi 根。`install_ios_store.py build` 要求手机处于 Android，
+读取并保留最新的 32 MiB 设置区，同时更新时间偏移。模块校验 boot_b 前 160 MiB，允许设置区正常变化。
+更新镜像前仍需执行 `check`；镜像更新后重新生成和安装启动模块。
 
 ## 约束（2026-11-01 只读核实）
 
@@ -43,8 +126,9 @@
 | `exaid`（384 MiB） | 系统卷第 2 段 |
 | `boot_b` 偏移 0 | loader 启动镜像：已验证的 alioth 镜像，只替换 payload 为 `loader.efi`，加 `store` 条目 `boot_b 400000 usb` |
 | `boot_b` 偏移 4 MiB | 清单（`struct store_manifest`，版本 2）：payload 和各段的位置、长度、CRC-32，以及时钟偏移 |
-| `boot_b` 偏移 8 MiB | 内核 payload：Wi-Fi 内核、`runtime/wifi/root.apfs`，参数同 `run_wifi_probe.py --steps 12 --seconds 0`，但不带 `epoch=` |
-| `boot_b` 偏移 48 MiB | 系统卷第 3 段（96.75 MiB） |
+| `boot_b` 偏移 8 MiB | 内核 payload（最大 52 MiB）：GPU 缩放、Wi-Fi、音频与蓝牙内核、`runtime/wifi/root.apfs`，参数同 `run_wifi_probe.py --steps 12 --seconds 0 --display-flip 1 --gpu-scale --sound-level 5 --bt-step 6 --prefs-store`，但不带 `epoch=` |
+| `boot_b` 偏移 60 MiB | 系统卷第 3 段（96.75 MiB） |
+| `boot_b` 偏移 160 / 176 MiB | 两份设置存档，每份 16 MiB |
 
 ### 写入（`scripts/install_ios_store.py`）
 

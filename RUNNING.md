@@ -1,3 +1,40 @@
+> 本文保留本机调试与首次启动历史。首次安装请从 [安装指南](docs/INSTALL.md) 开始；当前状态见 [README](README.md)。文中 runtime/logs/backups 路径仅存在于开发机，不随源码分发。
+
+2026-11-07 更新：本机已安装 **K40 · 进入 iOS v1.5（code 6）**。已从手机存储进入桌面，
+恢复应用/照片数据和 Wi-Fi，HTTP/HTTPS 返回 200；退出后回到 Android A，模块复检通过。
+当前手机停在 Android；在 ReSukiSU → 模块 → K40 · 进入 iOS →“操作”可再次进入。
+
+本轮增加 TrollStore 2.1.1 手机端 IPA 安装器，并完成小型原生 Ibili 的签名、安装、注册和启动测试。
+照片通过真实 PhotoKit 导入了一张测试图，界面能显示，重启后仍有一个资产。
+Files 的 Recents 不再崩溃，完整本地 Browse 尚未验证。
+
+数据区使用 cust 尾部的双槽归档，**可保存文件上限为 240 MiB**，不是 512 MiB 或 Android 的剩余空间。
+B 站可重建的模块缓存已迁到独立 RAM 挂载，数据存档由约 203 MiB 降到约 76 MiB。
+Android userdata 和 GPT 未调整。原 cust 和更新前后的启动/数据镜像均有本地校验备份。
+
+**B 站修改版还未适配完成**：列表和普通中文可显示，导航仍缺字；视频默认黑屏，实验 CPU 显示出现绿屏。
+默认启动未开启实验视频显示，也不包含自动点击、自动导入或测试音。
+记录与边界见 [应用和数据适配](docs/APPS-AND-DATA-20261107.md)。
+本轮证据在 `runtime/validation/20261107/apps-stored/`，写入校验在 `logs/apps-store-write-20261107.log`。
+
+以下是 v1.4 的显示、声音和蓝牙验证记录。
+
+2026-11-06：本机安装 **K40 · 进入 iOS v1.4**。在 ReSukiSU 模块页点“操作”从手机存储启动，
+Android A 保留；存储镜像三个分区均已读回校验。设置存档已恢复，Wi-Fi 自动连接，HTTP/HTTPS 返回 200。
+
+本轮合入 GPU 缩放、硬件三缓冲换帧和 2 ms 触摸轮询，用户确认“明显更顺滑，撕裂减少”。
+实际显示硬件计数仍约 60 Hz，真正 120 Hz 尚未实现。
+
+声音已通过三秒 AudioQueue 播放、Speaker 路由、HAL 无丢帧、双功放启停及 DSP 退出清理验证；
+蓝牙已通过原机固件下载、H4 和原生 iOS 栈初始化。声音保持低音量，听感、蓝牙搜索/配对/A2DP 仍需用户实测。
+麦克风和震动默认未启用；Apple ID 仍无法完成登录。
+
+构建、备份、写入范围与一键启动说明见 [手机启动说明](docs/ON-PHONE-BOOT.md)，
+供体与验证范围见 [上游评估](docs/UPSTREAM-REVIEW-20261106.md)。
+诊断版的自动测试音任务已从常驻镜像移除。
+
+以下为首次 USB RAM 启动的历史记录；其中“未配置设置持久化”仅描述当时的镜像。
+
 2026-11-01：本机 Redmi K40（alioth，M2012K11AC，8 GB）已通过 USB 临时启动 iOS 16.5。
 
 已确认的实机结果：
@@ -32,7 +69,7 @@ fastboot -s xnuloader reboot
 从 Android 再次启动：
 
 ```bash
-cd redmi-k40-ios-wifi
+cd redmi-k40-ios
 bash scripts/start_ios.sh ANDROID_SERIAL
 ```
 

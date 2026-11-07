@@ -48,12 +48,20 @@ extern void redwood_adreno_quiesce(void);
 extern void redwood_adreno_stop(void);
 extern void redwood_adreno_minute(void);
 #if defined(PLATFORM_ALIOTH)
+extern void alioth_display_quiesce(void);
 extern void alioth_wlan_wifi_stop(void);
 extern void alioth_wlan_wifi_quiesce(void);
 #endif
 extern void redwood_wifi_stop(void);
 extern void redwood_wifi_quiesce(void);
 extern void redwood_adsp_stop(void);
+#if defined(PLATFORM_ALIOTH)
+extern void alioth_bt_stop(void);
+extern void alioth_bt_quiesce(void);
+extern void alioth_audio_port_stop(void);
+extern void alioth_audio_port_cancel(void);
+extern void alioth_adsp_quiesce(void);
+#endif
 extern void redwood_adsp_quiesce(void);
 extern void redwood_ddr_quiesce(void);
 extern void redwood_haptic_quiesce(void);
@@ -247,6 +255,10 @@ struct loader_live {
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+    uint64_t magic3;                /* "XNULIVE3": completed scanout buffer for host screenshots */
+    const uint64_t *framebuffer;
+    uint64_t magic4;                /* XNULIVE4: padded scanout row size */
+    const uint64_t *framebuffer_stride;
 };
 
 /*
@@ -256,12 +268,15 @@ struct loader_live {
 uint64_t loader_recording[3];
 /* ... and of the sound (/dev/redwood-audio makes one with boot-arg rec_sound). */
 uint64_t loader_sound[3];
+uint64_t loader_framebuffer, loader_framebuffer_stride;
 
 struct loader_live loader_live = {
 	.magic = 0x214556494c554e58ULL, .log = loader_log, .log_len = &loader_log_len, .log_ring_at = &loader_log_ring_at,
 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+    .magic3 = 0x334556494c554e58ULL, .framebuffer = &loader_framebuffer,
+    .magic4 = 0x344556494c554e58ULL, .framebuffer_stride = &loader_framebuffer_stride,
 };
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
@@ -422,7 +437,13 @@ loader_return(void)
 	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 #if defined(PLATFORM_ALIOTH)
+	alioth_display_quiesce();
 	alioth_wlan_wifi_quiesce();
+#endif
+#if defined(PLATFORM_ALIOTH)
+    alioth_bt_quiesce();
+    alioth_audio_port_cancel();
+    alioth_adsp_quiesce();
 #endif
 	redwood_adsp_quiesce();         /* nor the audio DSP */
 	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
@@ -494,6 +515,10 @@ loader_return_timer(__unused thread_call_param_t p0, __unused thread_call_param_
 #if defined(PLATFORM_ALIOTH)
 	alioth_wlan_wifi_stop();
 #endif
+#if defined(PLATFORM_ALIOTH)
+        alioth_bt_stop();
+        alioth_audio_port_stop();
+#endif
 		redwood_adsp_stop();            /* and the audio DSP */
 	}
 	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
@@ -542,6 +567,10 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		redwood_wifi_stop();
 #if defined(PLATFORM_ALIOTH)
 	alioth_wlan_wifi_stop();
+#endif
+#if defined(PLATFORM_ALIOTH)
+        alioth_bt_stop();
+        alioth_audio_port_stop();
 #endif
 		redwood_adsp_stop();
 		loader_return();

@@ -1,0 +1,6 @@
+id=k40_ios_boot
+name=K40 · 进入 iOS
+version=1.5
+versionCode=6
+author=K40 iOS port
+description=点击操作进入 iOS；退出 iOS 后回到 Android。启动前核验本机镜像和 A 槽。

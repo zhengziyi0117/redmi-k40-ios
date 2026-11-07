@@ -26,16 +26,22 @@ root = Path(__file__).resolve().parents[1]
 out = root / 'runtime/store'
 MiB = 1 << 20
 IOS_BYTES, EXAID_BYTES, BOOT_BYTES = 1896 * MiB, 384 * MiB, 192 * MiB
-MANIFEST_AT, PAYLOAD_AT, PIECE_AT = 4 * MiB, 8 * MiB, 48 * MiB
+MANIFEST_AT, PAYLOAD_AT, PIECE_AT = 4 * MiB, 8 * MiB, 60 * MiB
+PREFS_AT = 160 * MiB
 BOOT_PART = 'boot_b'
 SYSTEM = root / 'runtime/boot/system.apfs'
 KERNEL = root / 'build/k40/xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837'
 ROOT_IMAGE = root / 'runtime/wifi/root.apfs'
+APP_DATA = False
+BILI_COMPAT = False
 BACKUP = root / 'backups/k40-before-ios-20261101'
 # run_wifi_probe.py --steps 12 --seconds 0, without epoch=: the kernel then takes the time from
 # the firmware's clock (boot-epoch), not from when the image was made
 CMDLINE = ('loader_return_after=604800 sb_delay=8 touchscreen=1 buttons=1 cpufreq=1 bootcpu=7 cpus=8 '
-           'adreno_soc=a650 adreno=21 adreno_keep=1 adreno_watch=10 aliothwifi=12 aliothwifidelay=8 wifi=1 wifi_quiet=1')
+           'adreno_soc=a650 adreno=21 adreno_keep=1 adreno_watch=10 aliothwifi=12 aliothwifidelay=8 wifi=1 wifi_quiet=1 '
+           'aliothflip=1 aliothscan=1 fb_beat=0 fb_queue=1 touch_poll_us=2000 fb_hz=120 '
+           'alioth_audio=5 alioth_sound_gain=0 alioth_sound_below=288 aliothbt=6 aliothbtdelay=45 '
+           'ufs=2 ufs_write=2 var_store=1')
 FIRMWARE = ('abl aop bluetooth cmnlib cmnlib64 devcfg dsp dtbo featenabler hyp imagefv keymaster mdtp mdtpsecapp '
             'modem multiimgoem multiimgqti qupfw tz uefisecapp vbmeta vbmeta_system vendor_boot vm-linux xbl xbl_config').split()
 IMAGES = (('ios', '/dev/block/mapper/ios'), ('exaid', '/dev/block/by-name/exaid'), (BOOT_PART, f'/dev/block/by-name/{BOOT_PART}'))
@@ -57,6 +63,43 @@ def sha256(path):
     return h.hexdigest()
 
 
+def verify_feature_root():
+    """Reject a root image missing the components required by the stored boot arguments."""
+    sys.path.insert(0, str(root / 'build/k40/tools/apfs'))
+    import apfs
+    container = apfs.Container(str(ROOT_IMAGE))
+    try:
+        volume = apfs.pick_volume(container, None)
+        required = ['fw-audio/adsp.mdt', 'fw-bt/htbtfw20.tlv', 'fw-bt/htnv20.bin']
+        required += [f'LaunchDaemons/com.apple.{name}.plist' for name in
+                     ('mediaserverd', 'mediaremoted', 'nanoregistryd', 'bluetoothd', 'BlueTool')]
+        if APP_DATA:
+            required += [f'LaunchDaemons/com.apple.{name}.plist' for name in ('assetsd','FileProvider','mobile.installd','fontservicesd','mediaparserd','TextInput.kbd')]
+            required += ['bin/var_store_prefs','LaunchDaemons/com.redwood.installer-setup.plist']
+        if BILI_COMPAT:
+            required += ['lib/libalioth-bili.dylib']
+        for path in required:
+            if not volume.lookup(path):
+                sys.exit(f'Root lacks {path}; rebuild with --display-bridge PATH --audio --bluetooth')
+        binaries = {'lib/libredwood-gl.dylib': 'libredwood-gl.dylib',
+                    'lib/libalioth-bt.dylib': 'libalioth-bt.dylib',
+                    'lib/RedwoodAudio.driver/RedwoodAudio': 'RedwoodAudio',
+                    'bin/var_store': 'var_store_data' if APP_DATA else 'var_store_alioth'}
+        if APP_DATA:
+            binaries.update({'sbin/init':'init_apps','bin/installer_setup':'installer_setup',
+                             'lib/libalioth-installer.dylib':'libalioth-installer.dylib'})
+            binaries['lib/libalioth-app-trust.dylib']='libalioth-app-trust.dylib'
+        if BILI_COMPAT:
+            binaries['lib/libalioth-bili.dylib']='libalioth-bili.dylib'
+        for path, name in binaries.items():
+            entry = volume.lookup(path)
+            expected = root / 'build/k40/userland/obj' / name
+            if not entry or not expected.is_file() or volume.inode(entry[0]).contents() != expected.read_bytes():
+                sys.exit(f'Root has no matching {name}; rebuild its component and the feature root')
+    finally:
+        container.close()
+
+
 def clock_offset():
     """Seconds from the PMIC's clock (rtc0, which Android may not set) to the time, as Android
     keeps it: the loader adds them to the firmware's reading of that clock. 0 without a phone."""
@@ -71,10 +114,32 @@ def clock_offset():
 
 
 def build():
+    verify_feature_root()
     out.mkdir(parents=True, exist_ok=True)
     total = SYSTEM.stat().st_size
     rest = total - IOS_BYTES - EXAID_BYTES
-    assert 0 < rest <= BOOT_BYTES - PIECE_AT, f'system.apfs is {total} bytes: it does not fit the three pieces'
+    assert 0 < rest <= PREFS_AT - PIECE_AT, f'system.apfs is {total} bytes: it overlaps the settings store'
+    # Rebuilding an image must keep the newest credentials/settings, including both archive slots.
+    if adb('getprop ro.product.device').strip() != 'alioth':
+        sys.exit('Build requires this alioth in Android to preserve its settings and read the RTC offset')
+    app_data = None
+    if APP_DATA:
+        app_data = json.loads((root / 'runtime/app-test/manifest.json').read_text())
+        marker = subprocess.run(['adb','exec-out','dd if=/dev/block/by-name/cust bs=4096 skip=2048 count=1 2>/dev/null'],
+                                capture_output=True,check=True,timeout=30).stdout
+        if (len(marker)!=4096 or marker[:8]!=b'K40DATA1' or
+            zlib.crc32(marker[:56])!=struct.unpack_from('<I',marker,56)[0] or
+            struct.unpack_from('<II5Q',marker,8)!=(1,64,1024*MiB,16*MiB,496*MiB,512*MiB,512*MiB)):
+            sys.exit('Missing or invalid bounded application/data store; nothing built')
+        got=adb(f"dd if=/dev/block/by-name/cust bs=4096 skip=4096 count={app_data['apps_bytes']//4096} 2>/dev/null | sha256sum").split()[0]
+        if got!=app_data['apps_sha256']:
+            sys.exit('Application image differs from the checked build; nothing built')
+        app_data['immutable_cust_prefix_bytes']=512*MiB
+        app_data['immutable_cust_prefix_sha256']=phone_sha('/dev/block/by-name/cust',512*MiB)
+    saved = subprocess.run(['adb', 'exec-out', f'dd if=/dev/block/by-name/boot_b bs={MiB} skip=160 count=32 2>/dev/null'],
+                           capture_output=True, check=True, timeout=60).stdout
+    assert len(saved) == BOOT_BYTES - PREFS_AT, 'Could not preserve all 32 MiB of settings; nothing built'
+    (out / 'prefs-before-build.bin').write_bytes(saved)
     payload = out / 'payload.bin'
     run(sys.executable, str(root / 'build/k40/xnuloader/mkpayload.py'), '-o', str(payload),
         f'kernel={KERNEL}', f'ramdisk={ROOT_IMAGE}', '--cmdline', CMDLINE)
@@ -109,6 +174,7 @@ def build():
     boot[:len(l)] = l
     boot[PAYLOAD_AT:PAYLOAD_AT + len(p)] = p
     boot[PIECE_AT:PIECE_AT + rest] = tail
+    boot[PREFS_AT:] = saved
     clock = clock_offset()
     manifest = struct.pack('<8sIIQII40sQ', b'XNUSTORE', 2, len(pieces), total, len(p), zlib.crc32(p),
                            BOOT_PART.encode(), PAYLOAD_AT)
@@ -125,6 +191,9 @@ def build():
         'kernel_sha256': sha256(KERNEL), 'root_sha256': sha256(ROOT_IMAGE), 'loader_sha256': sha256(loader),
         'cmdline': CMDLINE, 'clock_offset': clock, 'pieces': [dict(partition=n, offset=o, bytes=s, crc32=f'{c:08x}') for (n, o, s), c in zip(pieces, crcs)],
         'images': {n: sha256(out / f'{n}.img') for n, _ in IMAGES},
+        'boot_prefix_sha256': hashlib.sha256(boot[:PREFS_AT]).hexdigest(),
+        'prefs_offset': PREFS_AT, 'prefs_bytes': BOOT_BYTES - PREFS_AT,
+        'app_data': app_data,
         'built_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
     }
     (out / 'manifest.json').write_text(json.dumps(info, indent=2) + '\n')
@@ -152,7 +221,8 @@ def check():
     differ = [l.split()[0] for l in hashes.splitlines() if len(set(l.split()[1:])) != 1]
     print('firmware: both slots the same' if not differ else f'firmware DIFFERS between slots: {differ}')
     ok &= not differ
-    built = json.loads((out / 'manifest.json').read_text())['images'] if (out / 'manifest.json').exists() else {}
+    build_info = json.loads((out / 'manifest.json').read_text()) if (out / 'manifest.json').exists() else {}
+    built = build_info.get('images', {})
     stock_boot = json.loads((BACKUP / 'manifest.json').read_text())['partitions'][BOOT_PART]['sha256']
     state = {}
     has_ios = adb('ls /dev/block/mapper/ios 2>/dev/null || true').strip() != ''
@@ -163,6 +233,8 @@ def check():
             continue
         h = phone_sha(dev)
         if h == built.get(name):
+            state[name] = 'ours'
+        elif name == BOOT_PART and build_info.get('boot_prefix_sha256') == phone_sha(dev, PREFS_AT):
             state[name] = 'ours'
         elif name == BOOT_PART and h == stock_boot:
             state[name] = 'stock (as backed up)'
@@ -277,6 +349,33 @@ def uninstall():
           json.loads((BACKUP / 'manifest.json').read_text())['partitions'][BOOT_PART]['sha256'])
 
 
-p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-p.add_argument('step', choices=['build', 'check', 'partition', 'write', 'uninstall'])
-{'build': build, 'check': check, 'partition': partition, 'write': write, 'uninstall': uninstall}[p.parse_args().step]()
+def main():
+    global APP_DATA, BILI_COMPAT, CMDLINE
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('step', choices=['build', 'check', 'partition', 'write', 'uninstall'])
+    p.add_argument('--app-data',action='store_true',help='build with the already-provisioned cust-tail app/data store; never overwrite it')
+    p.add_argument('--bili-software-decode',action='store_true',help='enable the UUID-guarded native Bilibili compatibility adapter (requires --app-data)')
+    p.add_argument('--bili-sample-canvas',action='store_true',help='enable the sample-buffer CPU presenter after device validation (requires --bili-software-decode)')
+    p.add_argument('--bili-overlay-canvas',action='store_true',help='experimental pinned IJK overlay CPU presenter (requires --bili-software-decode)')
+    args=p.parse_args()
+    APP_DATA=args.app_data
+    BILI_COMPAT=args.bili_software_decode
+    if BILI_COMPAT and not APP_DATA:
+        p.error('--bili-software-decode requires --app-data')
+    if args.bili_sample_canvas and not BILI_COMPAT:
+        p.error('--bili-sample-canvas requires --bili-software-decode')
+    if args.bili_overlay_canvas and not BILI_COMPAT:
+        p.error('--bili-overlay-canvas requires --bili-software-decode')
+    if APP_DATA:
+        CMDLINE=CMDLINE.replace('ufs_write=2','ufs_write=3')+' alioth_apps=1 var_save_ms=60000'
+    if BILI_COMPAT:
+        CMDLINE+=' alioth_bili_sw=1'
+    if args.bili_sample_canvas:
+        CMDLINE+=' alioth_bili_sample=1'
+    if args.bili_overlay_canvas:
+        CMDLINE+=' alioth_bili_canvas=1'
+    {'build': build, 'check': check, 'partition': partition, 'write': write, 'uninstall': uninstall}[args.step]()
+
+
+if __name__ == '__main__':
+    main()

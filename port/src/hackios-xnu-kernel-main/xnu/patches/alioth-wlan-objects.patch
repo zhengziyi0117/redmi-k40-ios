@@ -1,9 +1,18 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -110,6 +110,16 @@
+@@ -110,6 +110,25 @@
  
  bsd/dev/monotonic.c optional monotonic
  bsd/dev/redwood_input.c		standard
++bsd/dev/alioth_display.c			standard
++bsd/dev/alioth_bt.c		standard
++bsd/dev/alioth_adsp.c		standard
++bsd/dev/alioth_audio.c		standard
++bsd/dev/alioth_sound.c		standard
++bsd/dev/alioth_cs35l41.c		standard
++bsd/dev/alioth_guard.c		standard
++bsd/dev/alioth_mic.c		standard
++bsd/dev/alioth_audio_port.c		standard
 +bsd/dev/alioth_pcie.c		standard
 +bsd/dev/alioth_wlan_rpmh.c		standard
 +bsd/dev/alioth_wlan_mhi.c		standard

@@ -961,6 +961,8 @@ struct kernel_live {
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
+    uint64_t magic3, framebuffer;   /* "XNULIVE3", virtual address of the completed frame's physical address */
+    uint64_t magic4, framebuffer_stride; /* XNULIVE4, virtual address of its row bytes */
 };
 
 /*
@@ -1663,8 +1665,11 @@ static struct loader_block block_shared __attribute__((aligned(0x2000)));
 static void block_io2_probe(efi_handle h, efi_block_io *bio);
 static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at block_start() */
 static efi_block_io *block_bios[BLOCK_MAX_PARTS];
+static uint64_t block_offsets[BLOCK_MAX_PARTS]; /* virtual subregions, relative to their parent Block I/O */
 static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
+static uint64_t block_write_first = BLOCK_WRITE_FIRST;
+static int block_write_mode;
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
 
@@ -1953,6 +1958,87 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 	return 1;
 }
 
+/* Alioth preferences occupy only boot_b[160 MiB, 192 MiB), beyond the installed system tail.
+ * Require the XNUSTORE v2 manifest and check that none of its immutable pieces overlap this range.
+ */
+static int
+block_is_alioth_prefs(const efi_partition_info *info, efi_block_io *bio, const struct loader_block_part *bp)
+{
+    static uint8_t manifest[4096] __attribute__((aligned(4096)));
+    if (PLAT->fb_base != 0x9c000000 || !str_eq(bp->name, "boot_b") || bp->block_size != 4096 ||
+        bp->blocks != 49152 || info->end_lba - info->start_lba + 1 != 49152 || bio->media->read_only) return 0;
+    if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1024, sizeof(manifest), manifest)) ||
+        memcmp(manifest, "XNUSTORE", 8) != 0) return 0;
+    uint32_t version, pieces, crc;
+    memcpy(&version, manifest + 8, 4);
+    memcpy(&pieces, manifest + 12, 4);
+    memcpy(&crc, manifest + 600, 4);
+    if (version != 2 || pieces == 0 || pieces > 8 || ufs_crc32(manifest, 600) != crc) return 0;
+    uint64_t payload_at; uint32_t payload_bytes;
+    memcpy(&payload_at, manifest + 72, 8); memcpy(&payload_bytes, manifest + 24, 4);
+    if (memcmp(manifest + 32, "boot_b\0", 7) != 0 || payload_at >= (160ULL << 20) ||
+        payload_bytes > (160ULL << 20) - payload_at) return 0;
+    for (uint32_t n = 0; n < pieces; n++) {
+        const uint8_t *piece = manifest + 80 + n * 64;
+        uint64_t at, bytes;
+        memcpy(&at, piece + 40, 8); memcpy(&bytes, piece + 48, 8);
+        if (memcmp(piece, "boot_b\0", 7) == 0 &&
+            (at >= (160ULL << 20) || bytes > (160ULL << 20) - at)) return 0;
+    }
+    print("ufs: Alioth preferences: boot_b blocks 40960..49151 only\n");
+    return 1;
+}
+
+/* The unused tail of this K40's cust partition, explicitly provisioned by the host.
+ * Preserve the existing ext4 volume (less than 8 MiB). Apps are read only; only
+ * the 512 MiB double-buffered data store is offered writable. No GPT changes. */
+static uint32_t rd32(const uint8_t *p);
+static uint64_t rd64(const uint8_t *p);
+static void
+block_add_alioth_data(uint64_t units)
+{
+    static uint8_t sector[4096] __attribute__((aligned(4096)));
+    if (PLAT->fb_base != 0x9c000000 || block_write_mode != 3) return;
+    for (uint32_t i = 0; i < block_shared.parts; i++) {
+        struct loader_block_part *parent = &block_shared.part[i];
+        efi_block_io *bio = block_bios[i];
+        if (!str_eq(parent->name, "cust") || parent->block_size != 4096 ||
+            parent->blocks != 262144 || bio->media->read_only ||
+            block_shared.parts + units + 2 > BLOCK_MAX_PARTS) continue;
+        if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 0, 4096, sector))) return;
+        uint32_t blocks = rd32(sector + 1028), log_block = rd32(sector + 1048);
+        if (sector[1080] != 0x53 || sector[1081] != 0xef || log_block > 6 ||
+            rd32(sector + 1024 + 0x150) != 0 || blocks == 0 ||
+            (uint64_t)blocks * (1024ULL << log_block) > (8ULL << 20)) {
+            print("ufs: cust filesystem reaches the reserved tail: no data store offered\n");
+            return;
+        }
+        if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 2048, 4096, sector))) return;
+        if (memcmp(sector, "K40DATA1", 8) != 0 || rd32(sector + 8) != 1 || rd32(sector + 12) != 64 ||
+            rd64(sector + 16) != (1024ULL << 20) || rd64(sector + 24) != (16ULL << 20) ||
+            rd64(sector + 32) != (496ULL << 20) || rd64(sector + 40) != (512ULL << 20) ||
+            rd64(sector + 48) != (512ULL << 20) || ufs_crc32(sector, 56) != rd32(sector + 56)) {
+            print("ufs: no valid K40DATA1 descriptor: cust stays read only\n");
+            return;
+        }
+        for (unsigned a = 0; a < 2; a++) {
+            uint32_t index = block_shared.parts++;
+            struct loader_block_part *part = &block_shared.part[index];
+            *part = *parent;
+            memset(part->name, 0, sizeof(part->name));
+            const char *name = a == 0 ? "iosapps" : "iosdata";
+            memcpy(part->name, name, 8);
+            block_offsets[index] = (a == 0 ? 16ULL : 512ULL) * 256;
+            part->blocks = (a == 0 ? 496ULL : 512ULL) * 256;
+            part->start_lba += block_offsets[index];
+            block_bios[index] = bio;
+            if (a == 1) { block_write_part = (int)index; block_write_first = 0; }
+        }
+        print("ufs: K40 apps 496 MiB read only; data store 512 MiB writable; cust prefix preserved\n");
+        return;
+    }
+}
+
 static void
 block_start(void)
 {
@@ -1971,6 +2057,7 @@ block_start(void)
 	uint64_t nunits = 0;
 
 	memset(&block_shared, 0, sizeof(block_shared));
+    memset(block_offsets, 0, sizeof(block_offsets));
 	block_tables();
 	/* the logical units: the block devices that are not partitions of another */
 	if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &blk_guid, NULL, &count, &handles))) {
@@ -2023,7 +2110,9 @@ block_start(void)
 				}
 			}
 		}
-		if (block_write_requested && block_is_darwin(info, bio, bp)) {
+		if (block_write_requested &&
+            ((block_write_mode == 1 && block_is_darwin(info, bio, bp)) ||
+             (block_write_mode == 2 && block_is_alioth_prefs(info, bio, bp)))) {
 			block_write_part = (int)block_shared.parts;
 		}
 		block_bios[block_shared.parts++] = bio;
@@ -2032,6 +2121,7 @@ block_start(void)
 			block_io2_probe(handles[i], bio);
 		}
 	}
+	block_add_alioth_data(nunits);
 	for (uint64_t u = 0; u < nunits; u++) {
 		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
 		char *n = bp->name;
@@ -2072,7 +2162,7 @@ block_start(void)
 	block_writes = block_writes_refused = block_write_bytes = 0;
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
-		block_shared.write_first = BLOCK_WRITE_FIRST;
+		block_shared.write_first = block_write_first;
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -2199,7 +2289,7 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE) {
-			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
+			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < block_write_first) {
 				/* not darwin, or not past what the build writes from the computer: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
@@ -2219,10 +2309,10 @@ block_poll(void)
 				flush_dcache((uint64_t)(uintptr_t)block_buffer,
 				    (uint64_t)(uintptr_t)block_buffer + bytes);
 				want = ufs_crc32(block_buffer, bytes);
-				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+				s = bio->write_blocks(bio, bio->media->media_id, lba + block_offsets[part], bytes, block_buffer);
 				if (!EFI_ERROR(s)) {
 					bio->flush_blocks(bio);
-					s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+					s = bio->read_blocks(bio, bio->media->media_id, lba + block_offsets[part], bytes, block_buffer);
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
 					if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
@@ -2237,7 +2327,7 @@ block_poll(void)
 				}
 			}
 		} else if (op == BLOCK_OP_READ) {
-			s = bio->read_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+			s = bio->read_blocks(bio, bio->media->media_id, lba + block_offsets[part], bytes, block_buffer);
 			/* what the controller wrote is in memory; drop whatever this core held of the buffer */
 			flush_dcache((uint64_t)(uintptr_t)block_buffer, (uint64_t)(uintptr_t)block_buffer + bytes);
 		} else {
@@ -2949,6 +3039,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
 	 * loader asked for (the loader stays resident across runs) */
 	block_write_requested = 0;
+    block_write_mode = 0;
+    block_write_first = BLOCK_WRITE_FIRST;
 	block_write_part = -1;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
@@ -2965,8 +3057,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			ufs_requested = c[4] - '0';
 		}
 		block_probe_requested |= starts_with(c, "ufs_probe=1") && (c == pi.cmdline || c[-1] == ' ');
-		block_write_requested |= starts_with(c, "ufs_write=1") && (c == pi.cmdline || c[-1] == ' ') &&
-		    (c[11] == 0 || c[11] == ' ');
+        if (starts_with(c, "ufs_write=") && (c == pi.cmdline || c[-1] == ' ') &&
+            (c[10] >= '1' && c[10] <= '3') && (c[11] == 0 || c[11] == ' ')) {
+            block_write_requested = 1;
+            block_write_mode = c[10] - '0';
+            block_write_first = block_write_mode == 2 ? 40960 : BLOCK_WRITE_FIRST;
+        }
 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
 		    c[11] <= '9';
 	}
@@ -4398,6 +4494,28 @@ store_writecmd(const char *arg)
  * One command from the host. While a kernel runs on another core (running_live) only what does
  * not disturb it: questions, the screen, the log so far, and "oem stop".
  */
+/* A completed Alioth scanout; its padded rows can differ from the firmware's console. */
+static uint64_t
+screenshot_frame(uint32_t *stride)
+{
+    *stride = SCREEN.stride;
+    uint64_t frame = SCREEN.base;
+    if (running_live != NULL && running_live->magic3 == 0x334556494c554e58ULL && running_live->framebuffer != 0) {
+        const uint64_t *shared = (const uint64_t *)(uintptr_t)(running_live->framebuffer + running_slide);
+        uint64_t candidate = *shared, row = SCREEN.stride;
+        if (running_live->magic4 == 0x344556494c554e58ULL && running_live->framebuffer_stride != 0) {
+            const uint64_t *rows = (const uint64_t *)(uintptr_t)(running_live->framebuffer_stride + running_slide);
+            if (*rows >= (uint64_t)SCREEN.width * 4 && *rows <= 16384) row = *rows;
+        }
+        uint64_t bytes = row * SCREEN.height;
+        if (SCREEN.base == 0x9c000000 && candidate >= SCREEN.base && candidate < 0x9e300000 &&
+            !(candidate & 0xff) && bytes <= 0x9e300000 - candidate) {
+            frame = candidate; *stride = (uint32_t)row;
+        }
+    }
+    return frame;
+}
+
 static void
 fb_command(char *cmd)
 {
@@ -4428,7 +4546,8 @@ fb_command(char *cmd)
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
 				/* width height bytes-per-row */
 				uint32_t mark = log_len;
-				print("%d %d %d", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, (uint64_t)SCREEN.stride);
+				uint32_t row; (void)screenshot_frame(&row);
+				print("%d %d %d", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, (uint64_t)row);
 				log_buf[log_len] = 0;
 				fb_reply("OKAY", log_buf + mark);
 				log_len = mark;
@@ -4503,8 +4622,10 @@ fb_command(char *cmd)
 				fb_reply("FAIL", "no display");
 				return;
 			}
-			staged_data = (const char *)(uintptr_t)SCREEN.base;
-			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
+            uint32_t row;
+            uint64_t frame = screenshot_frame(&row);
+            staged_data = (const char *)(uintptr_t)frame;
+            staged_len = (uint64_t)row * SCREEN.height;
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem recording")) {
 			/* stage what the kernel's display driver recorded (boot-arg rec_secs) */
